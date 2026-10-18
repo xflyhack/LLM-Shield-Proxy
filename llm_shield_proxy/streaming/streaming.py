@@ -638,8 +638,17 @@ async def rehydrate_sse_stream(
     watermark_text: Optional[str] = None,
     path: str = "v1/chat/completions",
     request_id: Optional[str] = None,
+    anthropic_native: bool = False,
 ) -> AsyncGenerator[bytes, None]:
-    """Asynchronous generator consuming raw SSE bytes and yielding rehydrated SSE chunks."""
+    """Asynchronous generator consuming raw SSE bytes and yielding rehydrated SSE chunks.
+
+    ``anthropic_native`` mirrors the request-side provider resolution: when the
+    request was NOT translated OpenAI->Anthropic (target provider != anthropic),
+    the downstream client speaks the Anthropic Messages protocol natively, so
+    Anthropic-shaped upstream events must keep their native structure on the
+    response path too. PII scanning/rehydration still applies -- only the event
+    *shape* is preserved, never the values unscanned.
+    """
     from llm_shield_proxy.security.attestation import StreamDigestReceipt
 
     session_id = getattr(vault, "session_id", "stateless-session")
@@ -727,6 +736,25 @@ async def rehydrate_sse_stream(
                 if not remaining:
                     continue
                 choice_index, tool_index = key
+                if anthropic_native and is_anthropic_stream:
+                    # Native client AND an Anthropic-shaped stream: the held-back tail
+                    # re-enters as a native event on its own block. An OpenAI-shaped
+                    # stream under a native-capable proxy keeps the OpenAI flush so the
+                    # dialect of the wire is never mixed.
+                    if tool_index is None:
+                        flush_event: dict = {
+                            "type": "content_block_delta",
+                            "index": native_text_block_index,
+                            "delta": {"type": "text_delta", "text": remaining},
+                        }
+                    else:
+                        flush_event = {
+                            "type": "content_block_delta",
+                            "index": anthropic_tool_block_indices.get(tool_index, 0),
+                            "delta": {"type": "input_json_delta", "partial_json": remaining},
+                        }
+                    yield f"data: {json.dumps(flush_event).decode('utf-8')}\n\n".encode()
+                    continue
                 if tool_index is None and choice_index in completion_choices:
                     flush_obj: dict = {"choices": [{"index": choice_index, "text": remaining}]}
                     yield f"data: {json.dumps(flush_obj).decode('utf-8')}\n\n".encode()
@@ -744,6 +772,11 @@ async def rehydrate_sse_stream(
         # is prose would otherwise open a tool call at index 1 with no index 0 in front of
         # it. Clients concatenate by index, so ordinals are handed out densely from 0.
         anthropic_tool_ordinals: Dict[int, int] = {}
+        # Native-mode bookkeeping: the Anthropic block index each retention window's
+        # held-back tail must be re-emitted under. `native_text_block_index` tracks the
+        # latest text block; the reverse map recovers a tool ordinal's block index.
+        native_text_block_index: int = 0
+        anthropic_tool_block_indices: Dict[int, int] = {}
 
         def _anthropic_tool_ordinal(block_index: int) -> int:
             """The tool-call ordinal for one Anthropic content block, stable per stream.
@@ -996,29 +1029,44 @@ async def rehydrate_sse_stream(
                                     if "text" in delta and isinstance(delta["text"], str):
                                         scanned_line = True
                                         raw_content = delta["text"]
+                                        if anthropic_native:
+                                            native_text_block_index = _entry_index(data_obj)
                                         # One window for the whole Anthropic stream.
                                         rehydrated_content = _buffer_for((0, None)).process_delta_text(raw_content)
-                                        openai_chunk = {
-                                            "id": cached_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": cached_created,
-                                            "model": cached_model,
-                                            "choices": [
-                                                {
-                                                    "index": data_obj.get("index", 0),
-                                                    "delta": {"content": rehydrated_content},
-                                                }
-                                            ],
-                                        }
-                                        line = f"data: {json.dumps(openai_chunk).decode('utf-8')}"
+                                        if anthropic_native:
+                                            # Native client: keep the Anthropic event shape,
+                                            # rehydrated value only.
+                                            data_obj["delta"]["text"] = rehydrated_content
+                                            line = f"data: {json.dumps(data_obj).decode('utf-8')}"
+                                        else:
+                                            openai_chunk = {
+                                                "id": cached_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": cached_created,
+                                                "model": cached_model,
+                                                "choices": [
+                                                    {
+                                                        "index": data_obj.get("index", 0),
+                                                        "delta": {"content": rehydrated_content},
+                                                    }
+                                                ],
+                                            }
+                                            line = f"data: {json.dumps(openai_chunk).decode('utf-8')}"
                                     elif isinstance(delta.get("partial_json"), str):
                                         # Anthropic streams tool input as `partial_json` fragments.
                                         scanned_line = True
-                                        tool_ordinal = _anthropic_tool_ordinal(_entry_index(data_obj))
-                                        restored = _buffer_for((0, tool_ordinal)).process_delta_text(
+                                        _native_tool_block = _entry_index(data_obj)
+                                        _native_tool_ordinal = _anthropic_tool_ordinal(_native_tool_block)
+                                        if anthropic_native:
+                                            anthropic_tool_block_indices[_native_tool_ordinal] = _native_tool_block
+                                        restored = _buffer_for((0, _native_tool_ordinal)).process_delta_text(
                                             delta["partial_json"]
                                         )
-                                        line = _tool_call_line(tool_ordinal, restored)
+                                        if anthropic_native:
+                                            data_obj["delta"]["partial_json"] = restored
+                                            line = f"data: {json.dumps(data_obj).decode('utf-8')}"
+                                        else:
+                                            line = _tool_call_line(_native_tool_ordinal, restored)
                                     else:
                                         pass  # Skip deltas carrying neither text nor tool input
                                 # 3. Anthropic Content Block Start / Generic text delta
@@ -1027,35 +1075,79 @@ async def rehydrate_sse_stream(
                                     if "text" in cb and isinstance(cb["text"], str):
                                         scanned_line = True
                                         raw_content = cb["text"]
+                                        if anthropic_native:
+                                            native_text_block_index = _entry_index(data_obj)
                                         # Same single window as the delta branch above.
                                         rehydrated_content = _buffer_for((0, None)).process_delta_text(raw_content)
-                                        openai_chunk = {
-                                            "id": cached_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": cached_created,
-                                            "model": cached_model,
-                                            "choices": [
-                                                {
-                                                    "index": data_obj.get("index", 0),
-                                                    "delta": {"content": rehydrated_content},
-                                                }
-                                            ],
-                                        }
-                                        line = f"data: {json.dumps(openai_chunk).decode('utf-8')}"
+                                        if anthropic_native:
+                                            data_obj["content_block"]["text"] = rehydrated_content
+                                            line = f"data: {json.dumps(data_obj).decode('utf-8')}"
+                                        else:
+                                            openai_chunk = {
+                                                "id": cached_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": cached_created,
+                                                "model": cached_model,
+                                                "choices": [
+                                                    {
+                                                        "index": data_obj.get("index", 0),
+                                                        "delta": {"content": rehydrated_content},
+                                                    }
+                                                ],
+                                            }
+                                            line = f"data: {json.dumps(openai_chunk).decode('utf-8')}"
                                     elif cb.get("type") == "tool_use":
                                         # Opens the call so the client learns its id and name once.
                                         scanned_line = True
-                                        tool_ordinal = _anthropic_tool_ordinal(_entry_index(data_obj))
-                                        line = _tool_call_line(tool_ordinal, "", opener=cb)
+                                        if anthropic_native:
+                                            # Native client: the opener event is already in the
+                                            # exact shape it expects; pass through untouched.
+                                            pass
+                                        else:
+                                            tool_ordinal = _anthropic_tool_ordinal(_entry_index(data_obj))
+                                            line = _tool_call_line(tool_ordinal, "", opener=cb)
                                     else:
                                         pass  # Skip start blocks carrying neither
                                 elif data_obj.get("type") == "content_block_stop":
+                                    if anthropic_native:
+                                        # A native stream has no [DONE] sentinel; block stop
+                                        # is the natural point to release this block's
+                                        # held-back text tail so the block is complete in
+                                        # the client's eyes.
+                                        stopped_block_index = _entry_index(data_obj)
+                                        if stopped_block_index == native_text_block_index:
+                                            text_tail = _flush_window((0, None))
+                                            if text_tail:
+                                                tail_event = {
+                                                    "type": "content_block_delta",
+                                                    "index": stopped_block_index,
+                                                    "delta": {"type": "text_delta", "text": text_tail},
+                                                }
+                                                pre_lines.append(
+                                                    f"data: {json.dumps(tail_event).decode('utf-8')}"
+                                                )
                                     # This block's arguments are complete here.
                                     stopped = anthropic_tool_ordinals.get(_entry_index(data_obj))
                                     if stopped is not None:
                                         stopped_tail = _flush_window((0, stopped))
                                         if stopped_tail:
-                                            pre_lines.append(_tool_call_line(stopped, stopped_tail))
+                                            if anthropic_native:
+                                                # Emit the held-back tail as a native
+                                                # input_json_delta so the block's arguments
+                                                # stay complete in Anthropic shape.
+                                                tail_event = {
+                                                    "type": "content_block_delta",
+                                                    "index": _entry_index(data_obj),
+                                                    "delta": {
+                                                        "type": "input_json_delta",
+                                                        "partial_json": stopped_tail,
+                                                    },
+                                                }
+                                                pre_lines.append(
+                                                    f"data: {json.dumps(tail_event).decode('utf-8')}"
+                                                )
+                                            else:
+                                                pre_lines.append(_tool_call_line(stopped, stopped_tail))
                                 elif data_obj.get("type") in ("message_stop", "message_delta", "ping"):
                                     pass  # We let [DONE] be handled at stream end
 
@@ -1100,7 +1192,18 @@ async def rehydrate_sse_stream(
                                     yield ready
 
                             if watermark_text:
-                                if is_anthropic_stream:
+                                if anthropic_native and is_anthropic_stream:
+                                    # Native client AND Anthropic-shaped stream: the
+                                    # watermark rides a native text_delta event.
+                                    watermark_anthropic = {
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {"type": "text_delta", "text": watermark_text},
+                                    }
+                                    watermark_piece = (
+                                        f"data: {json.dumps(watermark_anthropic).decode('utf-8')}\n\n".encode()
+                                    )
+                                elif is_anthropic_stream:
                                     anthropic_chunk = {
                                         "id": cached_id,
                                         "object": "chat.completion.chunk",
@@ -1198,7 +1301,14 @@ async def rehydrate_sse_stream(
                     yield flush_piece
 
                 if watermark_text:
-                    if is_anthropic_stream:
+                    if anthropic_native and is_anthropic_stream:
+                        watermark_anthropic_final = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": watermark_text},
+                        }
+                        yield f"data: {json.dumps(watermark_anthropic_final).decode('utf-8')}\n\n".encode()
+                    elif is_anthropic_stream:
                         anthropic_chunk = {
                             "id": cached_id,
                             "object": "chat.completion.chunk",

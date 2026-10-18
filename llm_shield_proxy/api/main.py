@@ -1479,6 +1479,11 @@ async def _proxy_catch_all_internal(
                                 watermark_text=watermark_text,  # type: ignore
                                 path=path,
                                 request_id=request_id,
+                                # Mirror the request-side provider decision: when the
+                                # request was NOT translated to Anthropic (upstream is
+                                # not api.anthropic.com), the client speaks Anthropic
+                                # natively and the SSE response must keep that shape.
+                                anthropic_native=(target_provider != "anthropic"),
                             ):
                                 yield b_chunk
                     except (GeneratorExit, asyncio.CancelledError):
