@@ -25,6 +25,8 @@ import yaml
 from llm_shield_proxy.core.config import DEFAULT_PROTECTED_PAYLOAD_KEYS, request_policy_ctx, settings
 from llm_shield_proxy.core.config_schema import CustomRegexConfig
 from llm_shield_proxy.engines.confusables import CONFUSABLE_TO_ASCII
+from llm_shield_proxy.engines.hits_recorder import record_hit
+from llm_shield_proxy.engines.span_cache import cached_spans_for
 from llm_shield_proxy.engines.vault import Vault
 from llm_shield_proxy.observability.audit import AuditLogger
 from llm_shield_proxy.observability.tracing import tracer
@@ -1113,10 +1115,10 @@ class PIIEngine:
         if not text:
             return text
 
-        # De-smuggle zero-width Unicode characters and normalize NFKC
-        working_text = normalize_and_desmuggle(text)
-
-        spans = self.detect_spans(working_text, active_profile)
+        # De-smuggle, normalize and detect -- memoized per session vault
+        # (engines/span_cache.py): multi-turn clients replay the same history
+        # strings every request; the cache skips re-scanning them.
+        working_text, spans = cached_spans_for(self, vault, active_profile, text)
         if not spans:
             return working_text
 
@@ -1125,6 +1127,7 @@ class PIIEngine:
         # Replace spans from right to left to preserve preceding string indices
         result = list(working_text)
         for start, end, entity_type, matched_text in reversed(spans):
+            record_hit(vault, entity_type, matched_text)
             token = mint(matched_text, entity_type)
             result[start:end] = list(token)
 

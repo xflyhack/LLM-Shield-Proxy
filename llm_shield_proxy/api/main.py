@@ -45,6 +45,7 @@ from llm_shield_proxy.api.health import health_router
 from llm_shield_proxy.api.mcp_router import mcp_router, warn_if_mcp_policy_is_empty_at_startup
 from llm_shield_proxy.api.webhook import webhook_router
 from llm_shield_proxy.core.config import request_policy_ctx, settings
+from llm_shield_proxy.engines.hits_recorder import clear_hits, flush_hits
 from llm_shield_proxy.engines.pii_engine import UnmappedBlobError, pii_engine
 from llm_shield_proxy.engines.stateless_mutation_engine.ast_mutator import (
     ASTDepthExceededException,
@@ -1185,6 +1186,7 @@ async def _proxy_catch_all_internal(
                             tier3_ner_entities=set(),
                         )
                     old_entities_count = sum(vault.type_counters.values())
+                    clear_hits(vault)  # sidecar must hold only this request's hits
 
                     import contextvars
                     ctx = contextvars.copy_context()
@@ -1224,6 +1226,11 @@ async def _proxy_catch_all_internal(
 
                     new_entities_count = sum(vault.type_counters.values())
                     entities_detected = new_entities_count - old_entities_count
+
+                    # First-hand hit values to Redis for the audit egress
+                    # (side channel; failure there never breaks this request)
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, flush_hits, vault, request_id)
 
                 if enable_blast_radius_limits and entities_detected > 0:
                     from llm_shield_proxy.security.rate_limit import blast_radius_limiter
