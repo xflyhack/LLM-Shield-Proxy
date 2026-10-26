@@ -755,6 +755,11 @@ class PIIEngine:
 
                     self._tenant_mappings = config.tenant_mappings
 
+                    # YAML settings 段可覆盖 Tier 2 熵检测开关(由 admin 后台管理)
+                    if config.settings and config.settings.enable_tier2_entropy is not None:
+                        self.enable_tier2 = config.settings.enable_tier2_entropy
+                        logger.info("Tier 2 entropy override from YAML: %s", self.enable_tier2)
+
                     logger.info(
                         "Successfully loaded custom regex patterns and %d profiles from %s",
                         len(self._compiled_profiles),
