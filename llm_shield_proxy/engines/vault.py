@@ -92,7 +92,7 @@ def _synthetic_for(fake: Any, entity_type: str, seed: int) -> str:
         return f"AKIA{''.join(random.Random(seed).choices(alphabet, k=16))}"  # nosec B311 noqa: S311
     if "GPE" in entity_type or "LOC" in entity_type:
         return fake.city()
-    return fake.word()
+    return f"{fake.first_name()}{seed % 900 + 100}"
 
 
 class Vault:
