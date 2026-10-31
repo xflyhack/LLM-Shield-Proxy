@@ -20,6 +20,13 @@ class CustomRegexSettings(BaseModel):
     enable_tier2_entropy: Optional[bool] = Field(
         None, description="Override Tier 2 Shannon entropy detection toggle from YAML"
     )
+    force_restorable: Optional[bool] = Field(
+        None,
+        description="When True, all redaction uses restorable (two-way) tokens — "
+        "system/developer/instructions/tool-prose content can be restored in responses. "
+        "Required for agentic proxying (e.g. Claude Code) where the model uses "
+        "system-prompt paths in tool_use outputs.",
+    )
 
 
 class CustomRegexConfig(BaseModel):
