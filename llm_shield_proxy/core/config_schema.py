@@ -15,7 +15,24 @@ class PolicyProfile(BaseModel):
     tier2_ner: List[str] = Field(default_factory=list, description="List of active Tier 2/3 entity names")
 
 
+class CustomRegexSettings(BaseModel):
+    """Optional global overrides embedded in custom_regex.yaml by the admin console."""
+    enable_tier2_entropy: Optional[bool] = Field(
+        None, description="Override Tier 2 Shannon entropy detection toggle from YAML"
+    )
+    force_restorable: Optional[bool] = Field(
+        None,
+        description="When True, all redaction uses restorable (two-way) tokens — "
+        "system/developer/instructions/tool-prose content can be restored in responses. "
+        "Required for agentic proxying (e.g. Claude Code) where the model uses "
+        "system-prompt paths in tool_use outputs.",
+    )
+
+
 class CustomRegexConfig(BaseModel):
     custom_patterns: List[CustomRegexPattern] = Field(default_factory=list)
     profiles: List[PolicyProfile] = Field(default_factory=list)
     tenant_mappings: Dict[str, str] = Field(default_factory=dict, description="Map of virtual_key_id to profile name")
+    settings: Optional[CustomRegexSettings] = Field(
+        None, description="Global settings overrides from admin console"
+    )

@@ -25,6 +25,8 @@ import yaml
 from llm_shield_proxy.core.config import DEFAULT_PROTECTED_PAYLOAD_KEYS, request_policy_ctx, settings
 from llm_shield_proxy.core.config_schema import CustomRegexConfig
 from llm_shield_proxy.engines.confusables import CONFUSABLE_TO_ASCII
+from llm_shield_proxy.engines.hits_recorder import record_hit
+from llm_shield_proxy.engines.span_cache import cached_spans_for
 from llm_shield_proxy.engines.vault import Vault
 from llm_shield_proxy.observability.audit import AuditLogger
 from llm_shield_proxy.observability.tracing import tracer
@@ -625,13 +627,18 @@ def _protected_inside_schema_data(protected: frozenset[str]) -> frozenset[str]:
     return protected - (DEFAULT_PROTECTED_PAYLOAD_KEYS - explicit)
 
 
-def _token_minter(vault: Any, restorable: bool) -> Callable[[str, str], str]:
+def _token_minter(vault: Any, restorable: bool, force_restorable: bool = False) -> Callable[[str, str], str]:
     """The vault method that mints a token, restorable or one-way.
 
     A vault that cannot mint one-way tokens gets a fixed marker rather than a
     restorable token.
+
+    When *force_restorable* is ``True`` (set via ``custom_regex.yaml``'s
+    ``settings.force_restorable``), even normally one-way content is minted as
+    restorable so that agentic clients can rehydrate paths/values the model
+    echoes from system prompts.
     """
-    if restorable:
+    if restorable or force_restorable:
         return vault.get_or_create_token
     return getattr(vault, "get_or_create_one_way_token", None) or (lambda _value, _type: "[REDACTED]")
 
@@ -676,6 +683,7 @@ class PIIEngine:
     ) -> None:
         self.enable_tier2: bool = enable_tier2
         self.enable_tier3: bool = enable_tier3
+        self.force_restorable: bool = False
         self.entropy_threshold: float = (
             entropy_threshold if entropy_threshold is not None else settings.SHANNON_ENTROPY_THRESHOLD
         )
@@ -752,6 +760,23 @@ class PIIEngine:
                         self._compiled_profiles[profile.name] = profile
 
                     self._tenant_mappings = config.tenant_mappings
+
+                    # YAML settings 段可覆盖 Tier 2 熵检测开关(由 admin 后台管理)
+                    if config.settings and config.settings.enable_tier2_entropy is not None:
+                        self.enable_tier2 = config.settings.enable_tier2_entropy
+                        logger.info("Tier 2 entropy override from YAML: %s", self.enable_tier2)
+
+                    # YAML settings 段可覆盖强制可还原开关(agentic 代理场景需要)
+                    if config.settings and config.settings.force_restorable is not None:
+                        self.force_restorable = config.settings.force_restorable
+                        if self.force_restorable:
+                            logger.warning(
+                                "force_restorable is ON: system/developer/tool-prose "
+                                "content will use restorable tokens. One-way redaction "
+                                "security boundary is disabled."
+                            )
+                        else:
+                            logger.info("force_restorable override from YAML: %s", self.force_restorable)
 
                     logger.info(
                         "Successfully loaded custom regex patterns and %d profiles from %s",
@@ -1113,18 +1138,19 @@ class PIIEngine:
         if not text:
             return text
 
-        # De-smuggle zero-width Unicode characters and normalize NFKC
-        working_text = normalize_and_desmuggle(text)
-
-        spans = self.detect_spans(working_text, active_profile)
+        # De-smuggle, normalize and detect -- memoized per session vault
+        # (engines/span_cache.py): multi-turn clients replay the same history
+        # strings every request; the cache skips re-scanning them.
+        working_text, spans = cached_spans_for(self, vault, active_profile, text)
         if not spans:
             return working_text
 
-        mint = _token_minter(vault, restorable)
+        mint = _token_minter(vault, restorable, self.force_restorable)
 
         # Replace spans from right to left to preserve preceding string indices
         result = list(working_text)
         for start, end, entity_type, matched_text in reversed(spans):
+            record_hit(vault, entity_type, matched_text)
             token = mint(matched_text, entity_type)
             result[start:end] = list(token)
 
@@ -1171,7 +1197,7 @@ class PIIEngine:
 
                     msg_copy = msg.copy()
                     role = msg_copy.get("role", "")
-                    restorable = role not in _PRIVILEGED_ROLES
+                    restorable = role not in _PRIVILEGED_ROLES or self.force_restorable
 
                     # 1. Redact message content (string or multi-part content blocks)
                     if "content" in msg_copy and isinstance(msg_copy["content"], str):
@@ -1231,7 +1257,7 @@ class PIIEngine:
                         if redacted_spaced != spaced_name:
                             msg_copy["name"] = redacted_spaced.replace(" ", "_")
                         elif raw_name and raw_name[0].isupper():
-                            mint = _token_minter(vault, restorable)
+                            mint = _token_minter(vault, restorable, self.force_restorable)
                             msg_copy["name"] = mint(raw_name, "PERSON").replace(" ", "_")
 
                     # 3. Redact OpenAI tool_calls function arguments in multi-turn agent history
@@ -1287,22 +1313,22 @@ class PIIEngine:
         if "system" in new_payload:
             if isinstance(new_payload["system"], str):
                 new_payload["system"] = self.redact_text(
-                    new_payload["system"], vault, active_profile, restorable=False
+                    new_payload["system"], vault, active_profile, restorable=not self.force_restorable
                 )
             elif isinstance(new_payload["system"], list):
                 new_payload["system"] = self._redact_text_blocks(
-                    new_payload["system"], vault, active_profile, restorable=False
+                    new_payload["system"], vault, active_profile, restorable=not self.force_restorable
                 )
 
         # Redact the Responses API instructions field, one-way like `system`.
         if "instructions" in new_payload:
             if isinstance(new_payload["instructions"], str):
                 new_payload["instructions"] = self.redact_text(
-                    new_payload["instructions"], vault, active_profile, restorable=False
+                    new_payload["instructions"], vault, active_profile, restorable=not self.force_restorable
                 )
             elif isinstance(new_payload["instructions"], list):
                 new_payload["instructions"] = [
-                    self._redact_input_item(item, vault, active_profile, restorable=False)
+                    self._redact_input_item(item, vault, active_profile, restorable=not self.force_restorable)
                     for item in new_payload["instructions"]
                 ]
 
@@ -1336,7 +1362,7 @@ class PIIEngine:
                     depth + 1,
                     max_depth,
                     key,
-                    one_way_keys=_TOOL_PROSE_KEYS,
+                    one_way_keys=frozenset() if self.force_restorable else _TOOL_PROSE_KEYS,
                 )
 
         # End-user identifiers; see _END_USER_ID_KEYS. Only a detected value is replaced,
@@ -1346,7 +1372,7 @@ class PIIEngine:
             if key in new_payload and key not in protected:
                 new_payload[key] = self._deep_redact(
                     new_payload[key], vault, active_profile, protected, ceiling, depth + 1, max_depth, key,
-                    restorable=False,
+                    restorable=not self.force_restorable,
                 )
 
         # A gateway such as LiteLLM merges `extra_body` into the provider request, so it
@@ -1661,7 +1687,7 @@ class PIIEngine:
             return item
 
         item_copy = item.copy()
-        restorable = restorable and item_copy.get("role") not in _PRIVILEGED_ROLES
+        restorable = restorable and (item_copy.get("role") not in _PRIVILEGED_ROLES or self.force_restorable)
         content = item_copy.get("content")
         if isinstance(content, str):
             item_copy["content"] = self.redact_text(content, vault, active_profile, restorable=restorable)
