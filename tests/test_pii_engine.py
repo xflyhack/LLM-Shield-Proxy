@@ -878,6 +878,62 @@ def test_replayed_tool_use_input_is_redacted():
     assert redacted["messages"][0]["content"][0]["name"] == "send_mail"
 
 
+def test_tool_use_input_past_blob_ceiling_is_scanned_in_full():
+    """Regression for LEAK-20261107: a tool argument longer than
+    PAYLOAD_MAX_REDACT_STRING_LENGTH with a secret in its middle used to take the
+    unmapped-blob path, whose edge scan misses it, and the plaintext reached the
+    provider (proxy.llmlink.cc leaked in 178 rows via tool_use.input.content).
+    A tool argument is caller-authored text, so the whole string is scanned."""
+    # In production the hostname is caught by a BYOR rule (rule #22 `llmlink`), so the
+    # engine is built with one loaded here too: without it the span never exists and the
+    # test would pass the routing while asserting nothing about detection.
+    custom_yaml = {
+        "custom_patterns": [
+            {
+                "name": "INTERNAL_HOSTNAME",
+                "pattern": r"proxy\.llmlink\.cc",
+                "description": "Matches the internal gateway hostname",
+            }
+        ]
+    }
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".yaml") as tmp:
+        yaml.dump(custom_yaml, tmp)
+        tmp_path = tmp.name
+
+    original_path = settings.CUSTOM_REGEX_PATH
+    try:
+        settings.CUSTOM_REGEX_PATH = tmp_path
+        engine = PIIEngine()
+
+        # Secret sits past the 256-char edge probes, in the blob-exempt middle.
+        filler = "x" * (settings.PAYLOAD_MAX_REDACT_STRING_LENGTH + 1000)
+        secret = "secret-hostname proxy.llmlink.cc end"
+        tool_argument = filler[:3000] + secret + filler[3000:]
+
+        payload = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "read_file",
+                            "input": {"content": tool_argument},
+                        }
+                    ],
+                }
+            ]
+        }
+        redacted = engine.redact_payload(payload, Vault())
+
+        assert "proxy.llmlink.cc" not in json.dumps(redacted)
+    finally:
+        settings.CUSTOM_REGEX_PATH = original_path
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def test_responses_reasoning_summary_and_custom_tool_input_are_redacted():
     engine = PIIEngine()
 
@@ -961,23 +1017,30 @@ def test_structured_schema_values_are_redacted_under_any_key(keyword):
 
 
 @pytest.mark.parametrize("keyword", ["enum", "const", "examples", "default"])
-def test_operator_protected_keys_still_hold_inside_schema_data(keyword, monkeypatch):
+def test_operator_protected_keys_still_hold_inside_schema_data(keyword):
     """Only the built-in structural keys are dropped inside schema data. A key the operator
     protected is a promise that its value goes out unchanged, wherever it sits."""
-    monkeypatch.setattr(settings, "PAYLOAD_PROTECTED_KEYS", "name")
-    engine = PIIEngine()
+    # monkeypatch.setattr cannot see attributes DynamicSettingsProxy only exposes through
+    # __getattr__, so pytest 9 records PAYLOAD_PROTECTED_KEYS as new and deletes it on
+    # undo; the try/finally the sibling tests use restores it correctly.
+    original = settings.PAYLOAD_PROTECTED_KEYS
+    try:
+        settings.PAYLOAD_PROTECTED_KEYS = "name"
+        engine = PIIEngine()
 
-    member = {"name": "jane.doe@example.com", "type": "bob@example.com"}
-    value = [member] if keyword in ("enum", "examples") else member
-    payload = {
-        "messages": [],
-        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"properties": {"to": {keyword: value}}}}}],
-    }
-    redacted = engine.redact_payload(payload, Vault())
-    serialised = json.dumps(redacted)
+        member = {"name": "jane.doe@example.com", "type": "bob@example.com"}
+        value = [member] if keyword in ("enum", "examples") else member
+        payload = {
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"properties": {"to": {keyword: value}}}}}],
+        }
+        redacted = engine.redact_payload(payload, Vault())
+        serialised = json.dumps(redacted)
 
-    assert "jane.doe@example.com" in serialised, "the operator-protected `name` must go out unchanged"
-    assert "bob@example.com" not in serialised, "the built-in `type` is only a field name here"
+        assert "jane.doe@example.com" in serialised, "the operator-protected `name` must go out unchanged"
+        assert "bob@example.com" not in serialised, "the built-in `type` is only a field name here"
+    finally:
+        settings.PAYLOAD_PROTECTED_KEYS = original
 
 
 def test_a_role_skip_key_that_is_also_built_in_still_holds_inside_schema_data():

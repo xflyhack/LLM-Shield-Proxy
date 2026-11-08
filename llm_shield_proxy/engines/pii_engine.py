@@ -1762,13 +1762,20 @@ class PIIEngine:
 
         No keys are protected here. They are the tool's own argument names, so a key that
         happens to be called `type` or `format` still holds a caller value.
+
+        The blob ceiling does not apply: a tool argument is caller-authored text (file
+        reads, command output, patches), never a base64 attachment, so a long string
+        here is text to scan in full. Routing it to _handle_unmapped_blob left the
+        middle of tool results past the ceiling uninspected, and replayed tool calls
+        re-deliver those secrets to the model on every later turn (incident
+        LEAK-20261107: proxy.llmlink.cc leaked in 178 rows via tool_use.input.content).
         """
         return self._deep_redact(
             tool_input,
             vault,
             active_profile,
             frozenset(),
-            settings.PAYLOAD_MAX_REDACT_STRING_LENGTH,
+            None,
             0,
             max_depth,
             "tool_use.input",
