@@ -1150,9 +1150,9 @@ class PIIEngine:
         # Replace spans from right to left to preserve preceding string indices
         result = list(working_text)
         for start, end, entity_type, matched_text in reversed(spans):
-            record_hit(vault, entity_type, matched_text)
             token = mint(matched_text, entity_type)
             result[start:end] = list(token)
+            record_hit(vault, entity_type, matched_text, token)
 
         return "".join(result)
 

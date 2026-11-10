@@ -1,7 +1,7 @@
 """Per-request record of what redaction replaced, shipped to Redis for the
 audit proxy's egress logger.
 
-redact_text holds the exact original value of every entity it replaces --
+redact_text holds the exact original and replacement of every entity it replaces --
 first-hand fact, no inference. This module parks those values on the session
 vault (setattr sidecar; Vault has no __slots__) while the payload is being
 redacted, then flushes them to Redis keyed by the request id the ingress
@@ -38,7 +38,7 @@ _client: Any = None
 _client_ready = False
 
 
-def record_hit(vault: Any, entity_type: str, matched_text: str) -> None:
+def record_hit(vault: Any, entity_type: str, matched_text: str, replacement: str) -> None:
     """Park one replaced value on the vault sidecar. Hot path: never raises."""
     hits = getattr(vault, _VAULT_ATTR, None)
     if hits is None:
@@ -47,7 +47,7 @@ def record_hit(vault: Any, entity_type: str, matched_text: str) -> None:
             setattr(vault, _VAULT_ATTR, hits)
         except AttributeError:  # exotic vault with __slots__: skip recording
             return
-    hits.add((entity_type, matched_text))
+    hits.add((entity_type, matched_text, replacement))
 
 
 def clear_hits(vault: Any) -> None:
@@ -64,14 +64,17 @@ def clear_hits(vault: Any) -> None:
 
 def flush_hits(vault: Any, request_id: Optional[str]) -> None:
     """Ship the sidecar to Redis. Run in the executor; never raises."""
-    hits: Optional[Set[Tuple[str, str]]] = getattr(vault, _VAULT_ATTR, None)
+    hits: Optional[Set[Tuple[str, str, str]]] = getattr(vault, _VAULT_ATTR, None)
     if not hits or not request_id:
         return
     client = _redis_client()
     if client is None:
         return
     try:
-        payload = [{"type": t, "value": v} for t, v in sorted(hits)]
+        payload = [
+            {"type": t, "value": v, "replacement": replacement}
+            for t, v, replacement in sorted(hits)
+        ]
         client.setex(
             f"{_KEY_PREFIX}{request_id}",
             _TTL_SECONDS,
