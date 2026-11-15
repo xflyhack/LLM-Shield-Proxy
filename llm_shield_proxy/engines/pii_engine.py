@@ -1146,10 +1146,16 @@ class PIIEngine:
             return working_text
 
         mint = _token_minter(vault, restorable, self.force_restorable)
+        is_known = getattr(vault, "is_known_token", None)
 
         # Replace spans from right to left to preserve preceding string indices
         result = list(working_text)
         for start, end, entity_type, matched_text in reversed(spans):
+            # A stand-in this vault already issued is left as it is: the client is
+            # replaying what it was sent. Redacting it again would token a token,
+            # and rehydration only unwinds one layer.
+            if is_known is not None and is_known(matched_text):
+                continue
             token = mint(matched_text, entity_type)
             result[start:end] = list(token)
             record_hit(vault, entity_type, matched_text, token)
@@ -1256,7 +1262,11 @@ class PIIEngine:
                         )
                         if redacted_spaced != spaced_name:
                             msg_copy["name"] = redacted_spaced.replace(" ", "_")
-                        elif raw_name and raw_name[0].isupper():
+                        elif (
+                            raw_name
+                            and raw_name[0].isupper()
+                            and not getattr(vault, "is_known_token", lambda _v: False)(raw_name)
+                        ):
                             mint = _token_minter(vault, restorable, self.force_restorable)
                             msg_copy["name"] = mint(raw_name, "PERSON").replace(" ", "_")
 

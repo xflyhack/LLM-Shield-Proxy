@@ -179,6 +179,17 @@ class Vault:
     def _token_taken(self, token: str) -> bool:
         return token in self.token_to_original or token in self._one_way_tokens
 
+    def is_known_token(self, token: str) -> bool:
+        """True when `token` is a stand-in this vault already minted.
+
+        Lets the request path skip re-redacting its own output: a client replays
+        the conversation, which carries the stand-ins it was sent, and redacting
+        those again would mint a token for a token and bury the original one
+        layer deeper than rehydration unwinds.
+        """
+        with self._lock:
+            return self._token_taken(token)
+
     def _mint_token(self, original_val: str, entity_type: str) -> str:
         """A fresh token for `original_val`. Caller holds the lock."""
         current_count = self.type_counters.get(entity_type, 0) + 1

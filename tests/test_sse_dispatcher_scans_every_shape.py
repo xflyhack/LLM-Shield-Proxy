@@ -157,6 +157,49 @@ def test_the_callers_own_value_is_still_restored(response_redaction_on):
     assert "bob@example.com" in out, "the caller's own value was not restored"
 
 
+def test_reasoning_and_reasoning_details_are_restored_across_fragments():
+    """OpenRouter repeats reasoning in three fields, each streaming its own fragments.
+
+    A stand-in split across two events must still come back whole in every carrier; the
+    `reasoning` and `reasoning_details[].text` copies used to stay placeholders.
+    """
+
+    async def main() -> str:
+        vault = Vault(synthetic=False)
+        token = vault.get_or_create_token("sarah@skynet.com", "EMAIL")
+        cut = len(token) // 2
+
+        def detail(fragment: str) -> str:
+            return _event(
+                '{"choices":[{"index":0,"delta":{"reasoning":"%s",'
+                '"reasoning_details":[{"type":"reasoning.text","index":0,"text":"%s"}]}}]}'
+                % (fragment, fragment)
+            )
+
+        async def source():
+            yield detail(token[:cut]).encode()
+            yield detail(token[cut:]).encode()
+
+        return "".join([c.decode() async for c in rehydrate_sse_stream(source(), vault)])
+
+    out = asyncio.run(main())
+    assert out.count("sarah@skynet.com") == 2, out
+    assert "[EMA" not in out and "IL_1]" not in out
+
+
+def test_reasoning_details_text_is_scanned(response_redaction_on):
+    """A reasoning_details copy is model output too and must not slip past the scanner."""
+    out = _drive(
+        [
+            _event(
+                '{"choices":[{"index":0,"delta":{"reasoning_details":'
+                '[{"type":"reasoning.text","index":0,"text":"thinking %s"}]}}]}' % MODEL_PII
+            )
+        ]
+    )
+    assert MODEL_PII not in out
+
+
 def test_done_marker_without_a_space_is_still_the_end_marker(response_redaction_on):
     """`data:[DONE]` is the same marker and must not be parsed as an event.
 

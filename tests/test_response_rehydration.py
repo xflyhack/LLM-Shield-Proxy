@@ -145,6 +145,43 @@ def test_ordinary_values_are_unchanged_by_escaping():
     assert message["tool_calls"][0]["function"]["arguments"] == '{"to": "sarah@skynet.com"}'
 
 
+def test_openai_reasoning_carriers_are_rehydrated():
+    """OpenRouter repeats reasoning in `reasoning` and `reasoning_details[].text`.
+
+    Only `reasoning_content` was restored, so the other two copies reached the caller as
+    placeholders while the same text was an original one field over. An encrypted
+    reasoning blob carries no readable text and must come back untouched.
+    """
+    vault = Vault(synthetic=False)
+    token = vault.get_or_create_token("sarah@skynet.com", "EMAIL")
+    sealed = "gAAAAABq-YzyWKLEkwrVDnsyolLl1Uq6"
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "ok",
+                    "reasoning_content": "reasoned about " + token,
+                    "reasoning": "reasoned about " + token,
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "reasoned about " + token, "index": 0},
+                        {"type": "reasoning.encrypted", "data": sealed},
+                    ],
+                }
+            }
+        ]
+    }
+
+    restored = _rehydrate_json_response(response, vault)
+    message = restored["choices"][0]["message"]
+
+    assert message["reasoning_content"] == "reasoned about sarah@skynet.com"
+    assert message["reasoning"] == "reasoned about sarah@skynet.com"
+    assert message["reasoning_details"][0]["text"] == "reasoned about sarah@skynet.com"
+    assert message["reasoning_details"][1]["data"] == sealed
+    assert token not in json.dumps(restored)
+
+
 def test_deeply_nested_tool_input_is_still_rehydrated():
     """A legitimately nested input must not keep placeholders below a shallow cutoff.
 

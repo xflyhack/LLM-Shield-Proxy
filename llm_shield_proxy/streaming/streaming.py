@@ -28,11 +28,13 @@ class StreamCapacityExceeded(ValueError):
 
 # Event keys whose values are structural.
 _SSE_STRUCTURAL_KEYS = frozenset(
-    {"id", "object", "model", "role", "type", "finish_reason", "index", "created"}
+    {"id", "object", "model", "role", "type", "finish_reason", "index", "created", "signature"}
 )
 
 # The ordered channels the retention buffer owns.
-_BUFFERED_CHANNEL_KEYS = frozenset({"content", "text", "arguments"})
+_BUFFERED_CHANNEL_KEYS = frozenset(
+    {"content", "text", "arguments", "reasoning_content", "reasoning", "reasoning_details"}
+)
 
 # How many retention windows one stream may open.
 MAX_STREAM_WINDOWS = 256
@@ -45,6 +47,13 @@ MAX_ANTHROPIC_TOOL_ORDINALS = 256
 
 # A retention window's identity: `(choice index, tool-call index or None)`.
 _WindowKey = tuple
+
+# One rule for every provider: readable thinking text is model-originated prose, so the
+# stand-ins the model reasoned over are restored just like the reply. Opaque thinking (a
+# sealed `redacted_thinking` blob) has no readable text and is never touched. A signature
+# that accompanies readable text does not change this: on the way back out the same vault
+# re-applies the same stand-in, so the provider receives byte-identical text and whatever
+# it verified over that text stays valid.
 
 
 def _entry_index(entry: Any) -> int:
@@ -767,6 +776,104 @@ async def rehydrate_sse_stream(
                 flush_obj = {"choices": [{"index": choice_index, "delta": delta}]}
                 yield f"data: {json.dumps(flush_obj).decode('utf-8')}\n\n".encode()
 
+        # Thinking text is model-originated prose like the reply, so the fakes the model
+        # reasoned over have to come back as originals for the client. Held until the block
+        # closes, because restoring needs the whole block to match a stand-in that may span
+        # fragment boundaries. A signature (which arrives after the text) does not gate the
+        # restore: see the module comment above.
+        _THINKING_FLUSH_CHUNK = 4096
+        thinking_pending: Dict[int, Dict[str, Any]] = {}
+        thinking_buffer = SSERehydrationBuffer(vault, max_output_bytes=max_output_piece_bytes)
+        # OpenAI-shaped reasoning carriers, all readable model prose with no signature:
+        # `reasoning_content` (DeepSeek/GLM), and `reasoning` / `reasoning_details[].text`
+        # (the OpenRouter family, which repeats the same text in all three). Each is
+        # restored in place on its own ordered window, keyed by
+        # `(choice index, carrier, reasoning_details index or None)`.
+        reasoning_buffers: Dict[tuple, SSERehydrationBuffer] = {}
+
+        def _thinking_frames(index: int, text: str) -> Iterator[str]:
+            for offset in range(0, len(text), _THINKING_FLUSH_CHUNK):
+                event = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": text[offset:offset + _THINKING_FLUSH_CHUNK],
+                    },
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(event).decode('utf-8')}"
+
+        def _finish_thinking(index: int) -> Iterator[str]:
+            entry = thinking_pending.pop(index, None)
+            if not entry or not entry["text"]:
+                return
+            text = entry["text"]
+            try:
+                restored = []
+                for offset in range(0, len(text), _THINKING_FLUSH_CHUNK):
+                    restored.append(
+                        thinking_buffer.process_delta_text(text[offset:offset + _THINKING_FLUSH_CHUNK])
+                    )
+                restored.append(thinking_buffer.process_delta_text("", is_final=True))
+                text = "".join(restored)
+            except Exception:  # noqa: BLE001 -- a restore failure must not break the stream
+                logger.warning(
+                    "Thinking rehydration failed; forwarding thinking as received", exc_info=True
+                )
+                text = entry["text"]
+            yield from _thinking_frames(index, text)
+
+        def _reasoning_buffer(key: tuple) -> SSERehydrationBuffer:
+            existing = reasoning_buffers.get(key)
+            if existing is not None:
+                return existing
+            if len(reasoning_buffers) >= MAX_STREAM_WINDOWS:
+                raise StreamCapacityExceeded(
+                    f"SSE stream opened more than {MAX_STREAM_WINDOWS} reasoning windows"
+                )
+            created = SSERehydrationBuffer(vault, max_output_bytes=max_output_piece_bytes)
+            reasoning_buffers[key] = created
+            return created
+
+        def _flush_reasoning(key: tuple) -> str:
+            window = reasoning_buffers.get(key)
+            return window.process_delta_text("", is_final=True) if window is not None else ""
+
+        def _reasoning_tail_delta(key: tuple, tail: str) -> dict:
+            """The delta that carries one window's held-back tail, in the carrier's shape."""
+            carrier = key[1]
+            if carrier == "reasoning_details":
+                return {
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "index": key[2], "text": tail}
+                    ]
+                }
+            return {carrier: tail}
+
+        def _merge_reasoning_tail(delta: dict, key: tuple, tail: str) -> None:
+            """Appends a held-back tail to the event that finishes the choice."""
+            carrier = key[1]
+            if carrier == "reasoning_details":
+                delta.setdefault("reasoning_details", []).append(
+                    {"type": "reasoning.text", "index": key[2], "text": tail}
+                )
+            else:
+                delta[carrier] = (delta.get(carrier) or "") + tail
+
+        def _flush_all_reasoning() -> Iterator[bytes]:
+            for key in sorted(reasoning_buffers):
+                tail = _flush_reasoning(key)
+                if not tail:
+                    continue
+                chunk = {"choices": [{"index": key[0], "delta": _reasoning_tail_delta(key, tail)}]}
+                yield f"data: {json.dumps(chunk).decode('utf-8')}\n\n".encode()
+
+        def _flush_pending_thinking() -> Iterator[bytes]:
+            """Emits any thinking block still open at the end of the stream."""
+            for block_index in sorted(thinking_pending):
+                for frame in _finish_thinking(block_index):
+                    yield (frame + "\n\n").encode("utf-8")
+
         # Anthropic block index -> the OpenAI tool-call ordinal it translates to. Anthropic
         # numbers tool blocks in the same space as text blocks, so a reply whose first block
         # is prose would otherwise open a tool call at index 1 with no index 0 in front of
@@ -991,6 +1098,39 @@ async def rehydrate_sse_stream(
                                             content_window = _buffer_for((choice_index, None))
                                             delta["content"] = content_window.process_delta_text(delta["content"])
                                             sibling_buffer = content_window
+                                        # Reasoning text (DeepSeek/GLM and friends) is a channel of
+                                        # its own: the model wrote it, so it is restored the same way.
+                                        # Reasoning text is model-originated prose carried on
+                                        # one or more OpenAI fields (see reasoning_buffers).
+                                        for carrier in ("reasoning_content", "reasoning"):
+                                            if isinstance(delta.get(carrier), str):
+                                                scanned_line = True
+                                                reasoning_window = _reasoning_buffer(
+                                                    (choice_index, carrier, None)
+                                                )
+                                                delta[carrier] = reasoning_window.process_delta_text(
+                                                    delta[carrier]
+                                                )
+                                                sibling_buffer = sibling_buffer or reasoning_window
+                                        details = delta.get("reasoning_details")
+                                        if isinstance(details, list):
+                                            for detail in details:
+                                                if (
+                                                    isinstance(detail, dict)
+                                                    and isinstance(detail.get("text"), str)
+                                                ):
+                                                    scanned_line = True
+                                                    reasoning_window = _reasoning_buffer(
+                                                        (
+                                                            choice_index,
+                                                            "reasoning_details",
+                                                            _entry_index(detail),
+                                                        )
+                                                    )
+                                                    detail["text"] = reasoning_window.process_delta_text(
+                                                        detail["text"]
+                                                    )
+                                                    sibling_buffer = sibling_buffer or reasoning_window
                                         # Tool arguments are model-generated text on their own ordered channel.
                                         for tool_index, function in _tool_argument_fragments(delta):
                                             scanned_line = True
@@ -1002,6 +1142,14 @@ async def rehydrate_sse_stream(
                                         # A finished choice parses its arguments now.
                                         if choice.get("finish_reason") is not None:
                                             drained = _flush_tool_windows_into(delta, choice_index)
+                                            for reasoning_key in sorted(reasoning_buffers):
+                                                if reasoning_key[0] != choice_index:
+                                                    continue
+                                                reasoning_tail = _flush_reasoning(reasoning_key)
+                                                if reasoning_tail:
+                                                    _merge_reasoning_tail(
+                                                        delta, reasoning_key, reasoning_tail
+                                                    )
                                             # Borrow the drained window rather than opening one.
                                             sibling_buffer = sibling_buffer or drained
                                         choice["delta"] = delta
@@ -1069,6 +1217,25 @@ async def rehydrate_sse_stream(
                                             line = _tool_call_line(_native_tool_ordinal, restored)
                                     else:
                                         pass  # Skip deltas carrying neither text nor tool input
+                                    # Thinking deltas are held for the block to close: see
+                                    # thinking_pending. `continue` keeps the raw text from
+                                    # reaching the client ahead of its restored form.
+                                    if delta.get("type") == "thinking_delta":
+                                        thinking_block_index = _entry_index(data_obj)
+                                        if isinstance(delta.get("thinking"), str):
+                                            scanned_line = True
+                                            entry = thinking_pending.setdefault(
+                                                thinking_block_index, {"text": ""}
+                                            )
+                                            entry["text"] += delta["thinking"]
+                                            continue
+                                    if delta.get("type") == "signature_delta":
+                                        scanned_line = True
+                                        # The signature line itself is forwarded untouched;
+                                        # it only marks the block closed early so the
+                                        # restored text still precedes it.
+                                        if delta.get("signature"):
+                                            pre_lines.extend(_finish_thinking(_entry_index(data_obj)))
                                 # 3. Anthropic Content Block Start / Generic text delta
                                 elif "content_block" in data_obj and isinstance(data_obj["content_block"], dict):
                                     cb = data_obj["content_block"]
@@ -1109,6 +1276,8 @@ async def rehydrate_sse_stream(
                                     else:
                                         pass  # Skip start blocks carrying neither
                                 elif data_obj.get("type") == "content_block_stop":
+                                    # The block is closed, so its held text goes out restored.
+                                    pre_lines.extend(_finish_thinking(_entry_index(data_obj)))
                                     if anthropic_native:
                                         # A native stream has no [DONE] sentinel; block stop
                                         # is the natural point to release this block's
@@ -1187,6 +1356,12 @@ async def rehydrate_sse_stream(
                                 yield ready
                         elif stripped == "data: [DONE]":
                             # Flush every choice's window BEFORE yielding the [DONE] signal
+                            for flush_piece in _flush_pending_thinking():
+                                for ready in _queue_output(flush_piece):
+                                    yield ready
+                            for flush_piece in _flush_all_reasoning():
+                                for ready in _queue_output(flush_piece):
+                                    yield ready
                             for flush_piece in _flush_all_windows():
                                 for ready in _queue_output(flush_piece):
                                     yield ready
@@ -1296,6 +1471,12 @@ async def rehydrate_sse_stream(
                 trailing_text = decoder.decode(b"", final=True)
                 if trailing_text:
                     line_accumulator += trailing_text
+
+                for flush_piece in _flush_pending_thinking():
+                    yield flush_piece
+
+                for flush_piece in _flush_all_reasoning():
+                    yield flush_piece
 
                 for flush_piece in _flush_all_windows():
                     yield flush_piece
