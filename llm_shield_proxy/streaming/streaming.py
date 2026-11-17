@@ -666,6 +666,7 @@ async def rehydrate_sse_stream(
     async def _inner_stream() -> AsyncGenerator[bytes, None]:
         nonlocal watermark_text
         line_accumulator = ""
+        pending_event = ""
         client_disconnected = False
         stream_aborted = False
         max_line_length = settings.MAX_SSE_LINE_LENGTH
@@ -1010,9 +1011,11 @@ async def rehydrate_sse_stream(
                         # Lines this event must emit BEFORE itself.
                         pre_lines: list = []
 
-                        if stripped.startswith("event: "):
-                            for ready in _queue_output((line + "\n").encode("utf-8")):
-                                yield ready
+                        if stripped.startswith("event:"):
+                            # A retained data line must retain its event header too.
+                            # Otherwise strict Anthropic clients parse an empty JSON
+                            # event and cancel the stream before the first token.
+                            pending_event = line
                             continue
 
                         # The space after `data:` is optional in the SSE spec.
@@ -1228,6 +1231,7 @@ async def rehydrate_sse_stream(
                                                 thinking_block_index, {"text": ""}
                                             )
                                             entry["text"] += delta["thinking"]
+                                            pending_event = ""
                                             continue
                                     if delta.get("type") == "signature_delta":
                                         scanned_line = True
@@ -1352,6 +1356,10 @@ async def rehydrate_sse_stream(
                                 # Terminated here, with its OWN blank line.
                                 for ready in _queue_output((pre_line + "\n\n").encode("utf-8")):
                                     yield ready
+                            if pending_event:
+                                for ready in _queue_output((pending_event + "\n").encode("utf-8")):
+                                    yield ready
+                                pending_event = ""
                             for ready in _queue_output((line + "\n").encode("utf-8")):
                                 yield ready
                         elif stripped == "data: [DONE]":
@@ -1408,9 +1416,15 @@ async def rehydrate_sse_stream(
                                     yield ready
                                 watermark_text = ""  # prevent double yield
 
+                            if pending_event:
+                                for ready in _queue_output((pending_event + "\n").encode("utf-8")):
+                                    yield ready
+                                pending_event = ""
                             for ready in _queue_output((line + "\n").encode("utf-8")):
                                 yield ready
                         else:
+                            if not stripped:
+                                pending_event = ""
                             for ready in _queue_output((line + "\n").encode("utf-8")):
                                 yield ready
 
